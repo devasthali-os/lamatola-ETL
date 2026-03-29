@@ -1,9 +1,10 @@
-# Google Cloud Composer Best Practices
+# Google Cloud Composer Best Practices – ML Feature Ingestion Pipeline
 
 > Applies to: `product_recommendation_feature_ingestion` DAG  
 > File: `dags/product_recs_feature.py`  
 > Target platform: Google Cloud Composer 2 (Airflow 2.8.x · GKE Autopilot)  
-> Current local stack: Airflow 2.8.1 · Docker Compose (dev)  
+> Designed for **high-throughput, low-latency** systems at Google scale —  
+> 10B+ events/day · 500M+ entities · < 10 ms online serving SLA  
 > Last updated: 2026-03-29
 
 ---
@@ -587,5 +588,117 @@ flowchart TD
 | 13 | IAM — Composer SA with minimal permissions | ❌ Todo | BQ, GCS, Secret Manager, Dataproc |
 | 14 | Private IP Composer environment | ⚠️ Todo | Required for production security posture |
 | 15 | Terraform IaC for Composer environment | ⚠️ Todo | Reproducible environment provisioning |
+
+---
+
+## 12. High-Throughput & Low-Latency Patterns on Composer
+
+### ✅ Use `KubernetesExecutor` instead of `LocalExecutor` for production scale
+
+```bash
+gcloud composer environments update prod-ml-feature-ingestion \
+  --location us-central1 \
+  --update-airflow-configs core-executor=KubernetesExecutor
+```
+
+At 10B+ events/day each task needs its own pod — `LocalExecutor` shares a single process and will OOM or serialize task execution.
+
+### ✅ Shard `extract_user_events` across hourly partitions using dynamic task mapping
+
+```python
+@task
+def extract_hour(ds: str, hour: int) -> dict: ...
+
+@dag(...)
+def pipeline():
+    # 24 parallel BQ extract pods, one per hour — ~24× throughput improvement
+    results = extract_hour.expand(ds=["{{ ds }}"] * 24, hour=list(range(24)))
+```
+
+### ✅ Use Dataflow for `transform_features` at > 100 GB/day
+
+Replace the single-node pandas transform with a horizontally-scaling Dataflow job:
+
+```python
+from airflow.providers.google.cloud.operators.dataflow import DataflowCreatePythonJobOperator
+
+transform_features = DataflowCreatePythonJobOperator(
+    task_id='transform_features',
+    py_file='gs://ml-feature-bucket/dataflow/transform_features.py',
+    options={
+        'runner':          'DataflowRunner',
+        'num_workers':     '50',
+        'max_num_workers': '200',
+        'machine_type':    'n2-standard-8',
+        'execution_date':  '{{ ds }}',
+    },
+    gcp_conn_id='google_cloud_default',
+)
+```
+
+### ✅ Size the Composer environment to match pipeline throughput
+
+| Daily event volume | Composer size | Scheduler replicas | Worker nodes |
+|---|---|---|---|
+| < 1 GB / day | Small | 1 | 3 (min) |
+| 1–100 GB / day | Medium | 2 | 6 |
+| 100 GB–1 TB / day | Large | 2 | 12+ with autoscale |
+| > 1 TB / day | Large + Dataflow/Spark | 2 | Dataflow handles workers |
+
+```bash
+# Scale to medium for production
+gcloud composer environments update prod-ml-feature-ingestion \
+  --location us-central1 \
+  --environment-size medium \
+  --scheduler-count 2 \          # HA schedulers
+  --scheduler-cpu 4 \
+  --scheduler-memory-gb 15 \
+  --worker-min-count 6 \
+  --worker-max-count 24 \        # autoscale up to 24 workers during burst
+  --worker-cpu 4 \
+  --worker-memory-gb 15
+```
+
+### ✅ Set `execution_timeout` on every task to prevent runaway GKE pods
+
+```python
+@task(execution_timeout=timedelta(hours=2))
+def transform_features(validated: dict) -> dict: ...
+
+@task(execution_timeout=timedelta(minutes=30))
+def load_feature_store(transformed: dict) -> None: ...
+```
+
+### ✅ Use Cloud Spanner or Bigtable for the online feature store at > 500M entities
+
+Redis Memorystore tops out at a few TB of RAM. At 500M+ users:
+
+```
+500M users × 10 features × 8 bytes = ~40 GB minimum
+With replication + overhead → > 100 GB → $2,000+/month on Memorystore
+```
+
+Switch to **Bigtable** (disk-backed, scales to petabytes, still < 10 ms P99):
+
+```python
+from google.cloud import bigtable
+
+@task(execution_timeout=timedelta(minutes=30))
+def load_feature_store(transformed: dict) -> None:
+    client = bigtable.Client(project='my_project')
+    table  = client.instance('prod-features').table('product_rec_features')
+    df     = pd.read_parquet(transformed['path'])
+
+    rows = []
+    for _, row in df.iterrows():
+        key = f"user#{row['entity_id']}#{transformed['date']}".encode()
+        bt_row = table.direct_row(key)
+        bt_row.set_cell('user_features', b'purchase_count_7d',
+                        str(int(row['purchase_count_7d'])).encode())
+        rows.append(bt_row)
+
+    # ✅ Bulk mutate — 100K+ rows/sec write throughput
+    table.mutate_rows(rows)
+```
 
 

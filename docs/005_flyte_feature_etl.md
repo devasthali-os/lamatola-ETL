@@ -1,8 +1,10 @@
-# Flyte – Best Practices for Product Recommendation
+# Flyte – Feature ETL Best Practices for Product Recommendation
 
 > Pipeline: `product_recommendation_feature_ingestion`  
 > Comparison baseline: Airflow 2.8.1 (`dags/product_recs_feature.py`)  
 > Flyte version: 1.x (flytekit ≥ 1.10)  
+> Designed for **high-throughput, low-latency** systems at Google / Amazon scale  
+> 10B+ events/day · 500M+ entities · < 10 ms online serving SLA  
 > Last updated: 2026-03-29
 
 ---
@@ -557,4 +559,108 @@ training steps that need GPU resources, large dataset caching, or per-experiment
 | 9 | Replace placeholder `print` stubs with real logic | ❌ Todo | Same as Composer migration |
 | 10 | Add `pytest` tests using `flytekit.testing` | ❌ Todo | Unit-test tasks locally without K8s |
 | 11 | Deploy Flyte on GKE or use Union.ai cloud | ❌ Todo | Infra prerequisite |
+
+---
+
+## 9. High-Throughput & Low-Latency Patterns in Flyte
+
+### ✅ Use `map_task` for massively parallel feature extraction
+
+At 10B+ events/day, shard extraction across 24 hourly partitions — each runs in its own pod:
+
+```python
+from flytekit import map_task, task, workflow
+
+@task(
+    requests=Resources(cpu="2", mem="8Gi"),
+    cache=True, cache_version="1.0",
+    retries=2,
+)
+def extract_user_events_hour(execution_date: str, hour: int) -> ExtractResult:
+    query = f"""
+        SELECT user_id, product_id, event_type, event_timestamp
+        FROM `my_project.events.user_interactions`
+        WHERE DATE(event_timestamp) = '{execution_date}'
+          AND EXTRACT(HOUR FROM event_timestamp) = {hour}
+    """
+    ...
+
+@workflow
+def product_recommendation_feature_ingestion(execution_date: str) -> None:
+    # ✅ 24 parallel pods, one per hour — ~24× throughput vs single extract task
+    hourly_results = map_task(extract_user_events_hour)(
+        execution_date=[execution_date] * 24,
+        hour=list(range(24)),
+    )
+    validated   = validate_features(hourly_results=hourly_results)
+    transformed = transform_features(validated=validated)
+    load_feature_store(transformed=transformed)
+```
+
+### ✅ Assign GPU resources to ML transform tasks
+
+```python
+from flytekit import Resources, task
+
+@task(
+    requests=Resources(cpu="8", mem="32Gi", gpu="1"),
+    limits=Resources(cpu="16",  mem="64Gi", gpu="2"),
+)
+def transform_features_gpu(validated: ValidatedResult) -> TransformResult:
+    # Run feature computation on GPU (e.g. cuDF / RAPIDS for 100× speedup)
+    import cudf
+    df = cudf.read_parquet(validated.user_events_path)
+    ...
+```
+
+### ✅ Use `SparkTask` for distributed transforms > 1 TB/day
+
+```python
+from flytekitplugins.spark import Spark, SparkTask
+
+transform_features_spark = SparkTask(
+    name="transform_features",
+    spark_conf={
+        "spark.executor.instances":      "50",
+        "spark.executor.memory":         "8g",
+        "spark.executor.cores":          "4",
+        "spark.driver.memory":           "4g",
+        "spark.sql.shuffle.partitions":  "800",   # tune to data size
+    },
+    task_config=Spark(),
+    requests=Resources(cpu="4", mem="8Gi"),
+)
+
+@transform_features_spark
+def transform_features(validated: ValidatedResult) -> TransformResult:
+    from pyspark.sql import SparkSession
+    spark = SparkSession.builder.getOrCreate()
+    df    = spark.read.parquet(validated.user_events_path)
+    # ... distributed feature computation ...
+```
+
+### ✅ Set `concurrency` on LaunchPlan to cap parallel daily runs
+
+```python
+daily_launch_plan = LaunchPlan.get_or_create(
+    name="daily_feature_ingestion",
+    workflow=product_recommendation_feature_ingestion,
+    schedule=CronSchedule(schedule="0 2 * * *"),
+    max_parallelism=1,          # ✅ never run 2 daily ingestions simultaneously
+)
+```
+
+### ✅ Use `FlyteDirectory` for large multi-file datasets
+
+When hourly shards produce many parquet files, pass a directory rather than a single file:
+
+```python
+from flytekit.types.directory import FlyteDirectory
+
+@task
+def extract_user_events_hour(execution_date: str, hour: int) -> FlyteDirectory:
+    output_dir = f"gs://ml-feature-bucket/raw/events/{execution_date}/hour={hour:02d}/"
+    # write multiple parquet part files
+    return FlyteDirectory(output_dir)
+```
 

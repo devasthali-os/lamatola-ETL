@@ -1,8 +1,10 @@
-# AWS Step Functions – Best Practices for Product Recommendation
+# AWS Step Functions – Feature ETL Best Practices for Product Recommendation
 
 > Pipeline: `product_recommendation_feature_ingestion`  
 > Comparison baseline: Airflow 2.8.1 (`dags/product_recs_feature.py`)  
 > AWS services used: Step Functions · Lambda · Glue · ECS Fargate · EventBridge  
+> Designed for **high-throughput, low-latency** systems at Amazon scale —  
+> 10B+ events/day · 500M+ entities · < 10 ms online serving SLA  
 > Last updated: 2026-03-29
 
 ---
@@ -626,4 +628,142 @@ flowchart TD
 | 12 | Deploy state machine via CDK / Terraform | ❌ Todo | IaC for reproducible deployments |
 | 13 | Implement manual backfill trigger script | ❌ Todo | No built-in backfill like Airflow |
 | 14 | Add CloudWatch alarms for failed executions | ❌ Todo | Replace Airflow SLA monitoring |
+
+---
+
+## 10. High-Throughput & Low-Latency Patterns in Step Functions
+
+### ✅ Use `Map` state for parallel hourly extraction at 10B+ events/day
+
+```yaml
+ExtractHourlyEvents:
+  Type: Map
+  ItemsPath: "$.hours"         # [0, 1, 2, ..., 23]
+  MaxConcurrency: 24           # 24 parallel Glue jobs, one per hour
+  Iterator:
+    StartAt: ExtractHour
+    States:
+      ExtractHour:
+        Type: Task
+        Resource: "arn:aws:states:::glue:startJobRun.sync"
+        Parameters:
+          JobName: "extract-user-events-hourly"
+          Arguments:
+            "--execution_date.$": "$.execution_date"
+            "--hour.$":           "$.hour"
+  ResultPath: "$.hourly_results"
+  Next: ValidateFeatures
+```
+
+### ✅ Use Glue with auto-scaling DPUs for large transforms
+
+```yaml
+TransformFeatures:
+  Type: Task
+  Resource: "arn:aws:states:::glue:startJobRun.sync"
+  Parameters:
+    JobName: "transform-features"
+    Arguments:
+      "--execution_date.$": "$.execution_date"
+    MaxCapacity: 100          # Glue DPUs — scales with data size
+    WorkerType: "G.2X"        # 8 vCPUs, 32 GB RAM per worker
+    NumberOfWorkers: 50       # 50 workers × 8 vCPUs = 400 vCPUs total
+  Retry:
+    - ErrorEquals: ["States.TaskFailed"]
+      IntervalSeconds: 60
+      MaxAttempts: 2
+      BackoffRate: 2.0
+```
+
+### ✅ Write to DynamoDB with `TransactWriteItems` for atomic upserts
+
+```python
+# Lambda — load_feature_store
+import boto3
+
+dynamodb = boto3.client('dynamodb')
+
+def handler(event, context):
+    ds      = event['execution_date']
+    items   = event['transformed']['items']   # list of feature dicts
+
+    # ✅ Batch write in chunks of 25 (DynamoDB TransactWriteItems limit)
+    for chunk in [items[i:i+25] for i in range(0, len(items), 25)]:
+        dynamodb.transact_write_items(
+            TransactItems=[
+                {
+                    'Put': {
+                        'TableName': 'product_rec_features',
+                        'Item': {
+                            'entity_id':           {'S': item['entity_id']},
+                            'feature_date':        {'S': ds},
+                            'purchase_count_7d':   {'N': str(item['purchase_count_7d'])},
+                            'category_affinity':   {'N': str(item['category_affinity'])},
+                            'popularity_score':    {'N': str(item['popularity_score'])},
+                            'co_view_rate':        {'N': str(item['co_view_rate'])},
+                            'ingested_at':         {'S': datetime.utcnow().isoformat()},
+                        },
+                        'ConditionExpression': 'attribute_not_exists(entity_id) OR feature_date = :ds',
+                        'ExpressionAttributeValues': {':ds': {'S': ds}},
+                    }
+                }
+                for item in chunk
+            ]
+        )
+```
+
+### ✅ Use ElastiCache (Redis Cluster) for < 1 ms online serving
+
+```python
+# Lambda — materialise_online_store (runs after load_feature_store)
+import redis
+
+r = redis.RedisCluster(
+    startup_nodes=[{"host": os.environ["REDIS_HOST"], "port": 6379}],
+    decode_responses=True,
+    skip_full_coverage_check=True,
+)
+
+def handler(event, context):
+    items = event['transformed']['items']
+    pipe  = r.pipeline(transaction=False)
+    for item in items:
+        key = f"user:{item['entity_id']}:features"
+        pipe.hset(key, mapping=item)
+        pipe.expire(key, 172800)   # 48h TTL
+        if len(pipe) >= 10_000:
+            pipe.execute()
+            pipe = r.pipeline(transaction=False)
+    pipe.execute()
+```
+
+### ✅ Add a streaming lane with Kinesis + Lambda for near-realtime features
+
+```mermaid
+flowchart LR
+    CLICK["User Click\nKinesis Data Stream"] --> KCL["Lambda\nKinesis consumer\n< 1s latency"]
+    KCL --> CACHE["ElastiCache\nRedis Cluster\nonline store"]
+    CACHE --> SERVE["Recommendation API\n< 1ms P99"]
+
+    SF["Step Functions\ndaily batch"] --> DDB["DynamoDB\n+ S3 offline store"]
+    SF --> CACHE
+```
+
+### ✅ Set CloudWatch alarms on DynamoDB and ElastiCache for SLA enforcement
+
+```bash
+# Alert if DynamoDB write latency exceeds 10ms
+aws cloudwatch put-metric-alarm \
+  --alarm-name "feature-store-write-latency" \
+  --metric-name SuccessfulRequestLatency \
+  --namespace AWS/DynamoDB \
+  --dimensions Name=TableName,Value=product_rec_features \
+               Name=Operation,Value=PutItem \
+  --statistic p99 \
+  --threshold 10 \
+  --comparison-operator GreaterThanThreshold \
+  --evaluation-periods 3 \
+  --period 60 \
+  --alarm-actions arn:aws:sns:us-east-1:123456789:ml-platform-alerts
+```
 

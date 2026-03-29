@@ -2,7 +2,8 @@
 
 > Applies to: `product_recommendation_feature_ingestion` DAG  
 > File: `dags/product_recs_feature.py`  
-> Stack: Apache Airflow 2.8.1 · LocalExecutor · PostgreSQL 15 · Docker Compose  
+> Stack: Apache Airflow 2.8.1 · LocalExecutor → KubernetesExecutor at scale  
+> Designed for **high-throughput, low-latency** systems at Google / Amazon scale  
 > Last updated: 2026-03-29
 
 ---
@@ -18,7 +19,8 @@
 7. [Logging & Observability](#7-logging--observability)
 8. [Testing](#8-testing)
 9. [CI/CD & Deployment](#9-cicd--deployment)
-10. [Current DAG vs Best Practice Gap Analysis](#10-current-dag-vs-best-practice-gap-analysis)
+10. [High-Throughput & Low-Latency Patterns](#10-high-throughput--low-latency-patterns)
+11. [Current DAG vs Best Practice Gap Analysis](#11-current-dag-vs-best-practice-gap-analysis)
 
 ---
 
@@ -549,5 +551,171 @@ logs/
 | **Unit tests** | None | ❌ Todo | Add `DagBag` + task function tests |
 | **`.gitignore`** | Not present | ❌ Todo | Add `.env`, `__pycache__/`, `*.pyc` |
 | **`requirements.txt`** | Not present | ❌ Todo | Add and bake into Docker image |
+
+---
+
+## 10. High-Throughput & Low-Latency Patterns
+
+These patterns apply when the pipeline must handle **Google / Amazon scale** —
+billions of events per day, hundreds of millions of entities, and < 10 ms online serving SLAs.
+
+### ✅ Switch to `KubernetesExecutor` for task isolation and elastic scale
+
+```python
+# airflow.cfg — production executor
+[core]
+executor = KubernetesExecutor
+
+[kubernetes]
+worker_container_repository = gcr.io/my_project/airflow-worker
+worker_container_tag        = 2.8.1
+delete_worker_pods          = True       # clean up after each task
+worker_pods_creation_batch_size = 32     # spin up 32 pods at once during burst
+```
+
+Each task runs in its own pod with dedicated CPU/memory — no noisy-neighbour worker processes.
+
+### ✅ Use `pool` slots to control concurrency per resource tier
+
+```python
+# Create pools in the Airflow UI or CLI
+airflow pools set bq_extract_pool   8   "Max 8 concurrent BQ extract tasks"
+airflow pools set redis_write_pool  4   "Max 4 concurrent Redis write tasks"
+
+# Assign in tasks
+@task(pool='bq_extract_pool', pool_slots=1)
+def extract_user_events(ds: str) -> dict: ...
+
+@task(pool='redis_write_pool', pool_slots=1)
+def load_feature_store(transformed: dict) -> None: ...
+```
+
+### ✅ Shard large daily extracts into hourly sub-DAGs
+
+At 10B+ events/day a single `extract_user_events` task will OOM or time out.
+Shard by hour and use `map_task` / dynamic task mapping:
+
+```python
+from airflow.decorators import task
+
+HOURS = list(range(24))
+
+@task
+def extract_user_events_hour(ds: str, hour: int) -> dict:
+    query = f"""
+        SELECT user_id, product_id, event_type, event_timestamp
+        FROM `my_project.events.user_interactions`
+        WHERE DATE(event_timestamp) = '{ds}'
+          AND EXTRACT(HOUR FROM event_timestamp) = {hour}
+    """
+    ...
+
+# Dynamic task mapping — 24 parallel extract tasks, one per hour
+@dag(...)
+def product_recommendation_feature_ingestion():
+    hourly_results = extract_user_events_hour.expand(
+        ds=["{{ ds }}"] * 24,
+        hour=HOURS,
+    )
+    validated = validate_features(hourly_results)
+    ...
+```
+
+### ✅ Replace pandas with Dataflow (Apache Beam) for transforms > 100 GB/day
+
+```python
+from airflow.providers.google.cloud.operators.dataflow import DataflowCreatePythonJobOperator
+
+@dag(...)
+def product_recommendation_feature_ingestion():
+    ...
+    transform_features = DataflowCreatePythonJobOperator(
+        task_id='transform_features',
+        py_file='gs://ml-feature-bucket/dataflow/transform_features.py',
+        job_name='transform-features-{{ ds_nodash }}',
+        options={
+            'runner':          'DataflowRunner',
+            'project':         'my_project',
+            'region':          'us-central1',
+            'temp_location':   'gs://ml-feature-bucket/tmp/',
+            'execution_date':  '{{ ds }}',
+            'num_workers':     '50',          # horizontally scale to 50 workers
+            'max_num_workers': '200',         # autoscale up to 200 during burst
+            'machine_type':    'n2-standard-8',
+        },
+        gcp_conn_id='google_cloud_default',
+    )
+```
+
+### ✅ Write to the online store in a separate task — never block the batch path
+
+```python
+# ✅ Two separate tasks — batch load and online materialise in parallel after transform
+
+@task(pool='redis_write_pool')
+def load_offline_store(transformed: dict) -> None:
+    # BQ MERGE — high throughput, tolerates seconds of latency
+    ...
+
+@task(pool='redis_write_pool')
+def materialise_online_store(transformed: dict) -> None:
+    # Redis pipeline write — must complete in < 5 min to meet serving SLA
+    ...
+
+@dag(...)
+def pipeline():
+    transformed = transform_features(...)
+    # ✅ Fan out — both run in parallel after transform
+    load_offline_store(transformed)
+    materialise_online_store(transformed)
+```
+
+### ✅ Set `execution_timeout` on every task — prevent runaway pods at scale
+
+```python
+@task(execution_timeout=timedelta(hours=2))
+def transform_features(validated: dict) -> dict: ...
+
+@task(execution_timeout=timedelta(minutes=30))
+def load_feature_store(transformed: dict) -> None: ...
+```
+
+### ✅ Tune Airflow scheduler for high DAG / task volume
+
+```ini
+[scheduler]
+max_dagruns_to_create_per_loop  = 50    # default 10 — increase for high DAG count
+max_dagruns_per_loop_to_schedule = 20
+parsing_processes               = 4     # parallel DAG file parsing
+min_file_process_interval       = 30    # re-parse DAGs every 30s, not 0s
+
+[core]
+parallelism                     = 512   # max total running tasks across all DAGs
+max_active_tasks_per_dag        = 64    # max concurrent tasks within one DAG run
+```
+
+### ✅ SLA budget per task — enforce the end-to-end serving freshness SLA
+
+At Google / Amazon scale, features must be in the online store before the recommendation
+engine's first request of the day (e.g. 06:00 UTC for US morning traffic).
+
+| Task | Max duration | SLA budget | Consequence of miss |
+|---|---|---|---|
+| `extract_user_events` | 1 h | 03:00 UTC | Stale features served |
+| `extract_product_catalog` | 30 min | 03:00 UTC | Missing new products |
+| `validate_features` | 10 min | 03:15 UTC | Block downstream |
+| `transform_features` | 90 min | 04:45 UTC | Features not materialised |
+| `load_feature_store` | 30 min | 05:15 UTC | Online store stale |
+
+```python
+default_args = {
+    ...
+    'sla': timedelta(hours=2),    # global SLA — alert if any task exceeds 2h
+}
+```
+
+---
+
+## 11. Current DAG vs Best Practice Gap Analysis
 
 

@@ -1,5 +1,7 @@
-# Feature Store Best Practices
+# Feature Store Best Practices – Product Recommendation Pipeline
 
+> Designed for **high-throughput, low-latency** systems at Google / Amazon scale  
+> 10B+ events/day · 500M+ entities · < 10 ms online serving SLA  
 > Stores evaluated: BigQuery · Vertex AI Feature Store · Redis · Bigtable  
 > Last updated: 2026-03-29
 
@@ -698,4 +700,112 @@ flowchart TD
 | **Production (< 500M users)** | BigQuery + Redis | Low latency serving + BQ for training |
 | **Production (> 500M users)** | BigQuery + Bigtable | Redis RAM cost too high at that scale |
 | **Fully managed / platform team** | Vertex AI Feature Store | Built-in monitoring, registry, and online sync |
+
+---
+
+## 10. High-Throughput & Low-Latency Scale Patterns
+
+### Write throughput targets
+
+| Store | Bulk write throughput | Single-key read latency | Max recommended entity count |
+|---|---|---|---|
+| BigQuery (batch load) | 1 TB/min (Parquet load job) | 1–5 s (SQL) | Unlimited |
+| Vertex AI Feature Store | ~100K rows/s (ingest API) | 10–50 ms (online) | ~1B |
+| Redis Cluster (6 shards) | ~1M ops/s (pipeline) | < 1 ms | ~500M (RAM-limited) |
+| Bigtable (10 nodes) | ~100K rows/s (bulk mutate) | 2–10 ms | Petabyte-scale |
+
+### ✅ Redis — use Cluster mode and connection pooling at scale
+
+```python
+from redis.cluster import RedisCluster
+from redis.connection import ConnectionPool
+
+# ✅ Redis Cluster — shards data across 6+ nodes, each with replicas
+pool = ConnectionPool(max_connections=50)
+r    = RedisCluster(
+    startup_nodes=[
+        {"host": "redis-node-1", "port": 6379},
+        {"host": "redis-node-2", "port": 6379},
+    ],
+    decode_responses=True,
+    skip_full_coverage_check=True,
+    connection_pool=pool,
+)
+
+# ✅ Pipeline batching — 50–100× faster than individual writes
+BATCH_SIZE = 10_000
+pipe = r.pipeline(transaction=False)
+for i, (_, row) in enumerate(df.iterrows()):
+    pipe.hset(f"user:{row['entity_id']}:features", mapping=row.to_dict())
+    pipe.expire(f"user:{row['entity_id']}:features", 172800)
+    if i % BATCH_SIZE == 0:
+        pipe.execute()
+        pipe = r.pipeline(transaction=False)
+pipe.execute()
+```
+
+### ✅ Bigtable — pre-split tablets to avoid write hotspots
+
+```python
+from google.cloud.bigtable import Client
+from google.cloud.bigtable.row_set import RowSet
+
+# ✅ Pre-split by entity_id prefix to distribute writes across tablets
+# Without splits all writes go to one tablet → hotspot → degraded throughput
+split_keys = [
+    b"user#1", b"user#3", b"user#5", b"user#7", b"user#9",
+    b"product#1", b"product#5",
+]
+table.create(initial_split_keys=split_keys)
+```
+
+### ✅ BigQuery — use slot reservations at high query volume
+
+```sql
+-- Reserve 2000 BigQuery slots for the feature pipeline project
+-- Prevents query queue during burst (e.g. backfill of 90 days)
+CREATE RESERVATION `my_project.US.feature_pipeline_reservation`
+  AS (slot_capacity = 2000);
+
+CREATE ASSIGNMENT `my_project.US.feature_pipeline_reservation.assignment`
+  AS (assignee = 'projects/my_project', job_type = 'QUERY');
+```
+
+### ✅ Add a streaming path for near-realtime feature freshness
+
+At Google / Amazon scale, a daily batch DAG means features can be up to 24 h stale.
+Add a streaming lane to reduce freshness to seconds for high-signal events:
+
+```mermaid
+flowchart LR
+    CLICK["User Click\nPub/Sub topic"] --> DF["Dataflow\nstreaming job\n< 5s latency"]
+    DF --> BT["Bigtable / Redis\nonline store\nupdated in realtime"]
+    BT --> SERVE["Recommendation API\n< 10ms P99"]
+
+    BATCH["Airflow DAG\ndaily 02:00 UTC"] --> BQ["BigQuery\noffline store\ntraining data"]
+    BATCH --> BT
+```
+
+```python
+# Dataflow streaming pipeline (Apache Beam)
+import apache_beam as beam
+from apache_beam.options.pipeline_options import PipelineOptions
+
+def run_streaming_pipeline():
+    options = PipelineOptions([
+        '--runner=DataflowRunner',
+        '--streaming',
+        '--project=my_project',
+        '--region=us-central1',
+    ])
+
+    with beam.Pipeline(options=options) as p:
+        (
+            p
+            | 'Read Pub/Sub' >> beam.io.ReadFromPubSub(topic='projects/my_project/topics/user-events')
+            | 'Parse'        >> beam.Map(parse_event)
+            | 'Compute'      >> beam.Map(compute_realtime_features)
+            | 'Write BT'     >> beam.ParDo(WriteToBigtable(instance='prod-features', table='product_rec_features'))
+        )
+```
 

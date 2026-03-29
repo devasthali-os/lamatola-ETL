@@ -1,4 +1,7 @@
-# Product Recs – Feature Ingestion Pipeline
+# Product Recommendation – Feature Ingestion Pipeline
+
+> Designed for **high-throughput, low-latency** systems at Google / Amazon scale:  
+> billions of user events · hundreds of millions of products · < 10 ms online serving SLA
 
 ## Overview
 
@@ -13,6 +16,7 @@
 | **Retries**         | 2 (retry delay: 5 minutes)                                                         |
 | **Tags**            | `ml`, `feature-ingestion`, `product-recommendation`                                |
 | **Operator Type**   | `@task` decorator (`PythonOperator`)                                               |
+| **Target scale**    | 10B+ events/day · 500M+ entities · sub-10ms online feature serving                |
 | **Purpose**         | Ingest user events & product catalogue → validate → transform → load feature store |
 
 ---
@@ -103,3 +107,41 @@ flowchart LR
     CHK -- No --> FAIL[❌ Mark Failed]
     FAIL --> ALERT[📧 Email Alert\nml-platform@example.com]
 ```
+
+---
+
+## Scale Considerations (Google / Amazon Scale)
+
+| Dimension | Threshold | Recommended approach |
+|---|---|---|
+| **Event volume** | > 1B events/day | Partition BQ table by hour, not day; use Dataflow/Spark for transform |
+| **Entity count** | > 500M users or products | Bigtable online store over Redis (RAM cost); shard BQ staging tables |
+| **Feature serving SLA** | < 10 ms P99 | Redis Cluster / Memorystore with read replicas; avoid cold paths |
+| **Feature serving SLA** | < 1 ms P99 | In-process feature cache (e.g. local LRU) in the serving container |
+| **Pipeline throughput** | > 100 GB/day | Replace pandas with Dataflow (Apache Beam) or Spark on Dataproc |
+| **Backfill speed** | Years of history | Parallel Airflow `max_active_runs > 1` with sharded date ranges |
+| **Online store write throughput** | > 100K writes/s | Redis Cluster with pipeline batching; Bigtable with bulk mutations |
+| **Training data freshness** | Near-realtime | Add a streaming path (Pub/Sub → Dataflow → Bigtable) alongside the batch DAG |
+
+### Production-scale pipeline shape
+
+```mermaid
+flowchart TD
+    subgraph Batch["⚙️ Batch Path — Airflow DAG (daily 02:00 UTC)"]
+        E1["extract_user_events\nBQ → GCS parquet\n~100 GB/day"] & E2["extract_product_catalog\nBQ snapshot"] --> V["validate_features\nPandera + row count checks"]
+        V --> T["transform_features\nDataflow / Spark\nhorizontally scalable"]
+        T --> L["load_feature_store\nBQ MERGE + Redis pipeline\nor Bigtable bulk mutations"]
+    end
+
+    subgraph Stream["⚡ Streaming Path (near-realtime)"]
+        PS["Pub/Sub\nuser event stream"] --> DF["Dataflow\nstreaming pipeline"] --> BT["Bigtable / Redis\nonline store"]
+    end
+
+    L --> FS_OFF["BigQuery\nOffline Store\npoint-in-time training data"]
+    L --> FS_ON["Redis / Bigtable\nOnline Store\n< 10ms serving"]
+    BT --> FS_ON
+
+    FS_OFF --> TRAIN["Vertex AI / SageMaker\nModel Training"]
+    FS_ON  --> SERVE["Recommendation API\n< 10ms P99 · 100K rps"]
+```
+
