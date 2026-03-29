@@ -588,3 +588,4 @@ flowchart TD
 | 14 | Private IP Composer environment | ⚠️ Todo | Required for production security posture |
 | 15 | Terraform IaC for Composer environment | ⚠️ Todo | Reproducible environment provisioning |
 
+

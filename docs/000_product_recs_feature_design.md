@@ -1,19 +1,19 @@
-# Product Recommendation – Feature Ingestion Pipeline
+# Product Recs – Feature Ingestion Pipeline
 
 ## Overview
 
-| Attribute         | Value                                                              |
-|-------------------|--------------------------------------------------------------------|
-| **DAG ID**        | `product_recommendation_feature_ingestion`                         |
-| **File**          | `dags/product_recs_feature.py`                                     |
-| **Owner**         | ml-platform                                                        |
-| **Schedule**      | `0 2 * * *` — daily at 02:00 UTC                                   |
-| **Catchup**       | `False`                                                            |
-| **Max Active Runs**| 1                                                                 |
-| **Retries**       | 2 (retry delay: 5 minutes)                                         |
-| **Tags**          | `ml`, `feature-ingestion`, `product-recommendation`                |
-| **Operator Type** | `@task` decorator (`PythonOperator`)                               |
-| **Purpose**       | Ingest user events & product catalogue → validate → transform → load feature store |
+| Attribute           | Value                                                                              |
+|---------------------|------------------------------------------------------------------------------------|
+| **DAG ID**          | `product_recommendation_feature_ingestion`                                         |
+| **File**            | `dags/product_recs_feature.py`                                                     |
+| **Owner**           | ml-platform                                                                        |
+| **Schedule**        | `0 2 * * *` — daily at 02:00 UTC                                                   |
+| **Catchup**         | `False`                                                                            |
+| **Max Active Runs** | 1                                                                                  |
+| **Retries**         | 2 (retry delay: 5 minutes)                                                         |
+| **Tags**            | `ml`, `feature-ingestion`, `product-recommendation`                                |
+| **Operator Type**   | `@task` decorator (`PythonOperator`)                                               |
+| **Purpose**         | Ingest user events & product catalogue → validate → transform → load feature store |
 
 ---
 
