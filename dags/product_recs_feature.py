@@ -18,22 +18,22 @@
 # under the License.
 
 """
-### Tutorial Documentation
-Documentation that goes along with the Airflow tutorial located
-[here](https://airflow.incubator.apache.org/tutorial.html)
+### Feature Ingestion Pipeline – Product Recommendation
+Airflow DAG responsible for ingesting raw product and user interaction features,
+transforming them, and making them available for the product recommendation engine.
 """
 from datetime import timedelta
 
-import airflow
 from airflow import DAG
-from airflow.operators.bash_operator import BashOperator
+from airflow.operators.bash import BashOperator
+from airflow.utils.dates import days_ago
 
 # These args will get passed on to each operator
 # You can override them on a per-task basis during operator initialization
 default_args = {
     'owner': 'airflow',
     'depends_on_past': False,
-    'start_date': airflow.utils.dates.days_ago(2),
+    'start_date': days_ago(2),
     'email': ['airflow@example.com'],
     'email_on_failure': False,
     'email_on_retry': False,
@@ -55,9 +55,9 @@ default_args = {
 }
 
 dag = DAG(
-    'tutorial',
+    'product_recommendation_feature_ingestion',
     default_args=default_args,
-    description='A simple tutorial DAG',
+    description='Feature ingestion data pipeline for the product recommendation engine',
     schedule_interval=timedelta(days=1),
 )
 
