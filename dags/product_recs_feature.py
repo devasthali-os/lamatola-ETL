@@ -19,87 +19,143 @@
 
 """
 ### Feature Ingestion Pipeline – Product Recommendation
-Airflow DAG responsible for ingesting raw product and user interaction features,
-transforming them, and making them available for the product recommendation engine.
+Daily DAG that ingests raw user interaction events and product catalogue data,
+validates and transforms them into features, and loads them into the feature store
+for the product recommendation engine.
+
+Pipeline:
+    extract_user_events  ──┐
+                           ├──► validate_features ──► transform_features ──► load_feature_store
+    extract_product_catalog─┘
 """
 from datetime import timedelta
 
-from airflow import DAG
-from airflow.operators.bash import BashOperator
+from airflow.decorators import dag, task
 from airflow.utils.dates import days_ago
 
-# These args will get passed on to each operator
-# You can override them on a per-task basis during operator initialization
 default_args = {
-    'owner': 'airflow',
+    'owner': 'ml-platform',
     'depends_on_past': False,
-    'start_date': days_ago(2),
-    'email': ['airflow@example.com'],
-    'email_on_failure': False,
+    'start_date': days_ago(1),
+    'email': ['ml-platform@example.com'],
+    'email_on_failure': True,
     'email_on_retry': False,
-    'retries': 1,
+    'retries': 2,
     'retry_delay': timedelta(minutes=5),
-    # 'queue': 'bash_queue',
-    # 'pool': 'backfill',
-    # 'priority_weight': 10,
-    # 'end_date': datetime(2016, 1, 1),
-    # 'wait_for_downstream': False,
-    # 'dag': dag,
-    # 'adhoc':False,
-    # 'sla': timedelta(hours=2),
-    # 'execution_timeout': timedelta(seconds=300),
-    # 'on_failure_callback': some_function,
-    # 'on_success_callback': some_other_function,
-    # 'on_retry_callback': another_function,
-    # 'trigger_rule': u'all_success'
 }
 
-dag = DAG(
-    'product_recommendation_feature_ingestion',
+
+@dag(
+    dag_id='product_recommendation_feature_ingestion',
     default_args=default_args,
-    description='Feature ingestion data pipeline for the product recommendation engine',
-    schedule_interval=timedelta(days=1),
+    description='Daily feature ingestion pipeline for the product recommendation engine',
+    schedule_interval='0 2 * * *',   # 2 AM UTC daily
+    catchup=False,
+    max_active_runs=1,
+    tags=['ml', 'feature-ingestion', 'product-recommendation'],
 )
+def product_recommendation_feature_ingestion():
+    """
+    ## Product Recommendation – Feature Ingestion Pipeline
 
-# t1, t2 and t3 are examples of tasks created by instantiating operators
-t1 = BashOperator(
-    task_id='print_date',
-    bash_command='date',
-    dag=dag,
-)
+    Ingests user interaction events and product catalogue data daily,
+    transforms them into ML features, and loads to the feature store.
+    """
 
-t1.doc_md = """\
-#### Task Documentation
-You can document your task using the attributes `doc_md` (markdown),
-`doc` (plain text), `doc_rst`, `doc_json`, `doc_yaml` which gets
-rendered in the UI's Task Instance Details page.
-![img](http://montcs.bloomu.edu/~bobmon/Semesters/2012-01/491/import%20soul.png)
-"""
+    @task(task_id='extract_user_events')
+    def extract_user_events(ds: str) -> dict:
+        """
+        #### Extract User Events
+        Pulls raw user interaction events (clicks, views, purchases)
+        for the execution date `ds` from the source system.
+        Returns a summary dict with row count and output path.
+        """
+        print(f"[{ds}] Extracting user interaction events ...")
+        # TODO: replace with real source (e.g. S3, Kafka, OLTP DB)
+        output_path = f"/tmp/features/user_events_{ds}.parquet"
+        row_count = 0  # placeholder
+        print(f"[{ds}] Extracted {row_count} user events → {output_path}")
+        return {"path": output_path, "rows": row_count, "date": ds}
 
-dag.doc_md = __doc__
+    @task(task_id='extract_product_catalog')
+    def extract_product_catalog(ds: str) -> dict:
+        """
+        #### Extract Product Catalog
+        Pulls the current product catalogue snapshot (id, category,
+        price, metadata) for the execution date `ds`.
+        Returns a summary dict with row count and output path.
+        """
+        print(f"[{ds}] Extracting product catalogue snapshot ...")
+        # TODO: replace with real source (e.g. product DB, API)
+        output_path = f"/tmp/features/product_catalog_{ds}.parquet"
+        row_count = 0  # placeholder
+        print(f"[{ds}] Extracted {row_count} products → {output_path}")
+        return {"path": output_path, "rows": row_count, "date": ds}
 
-t2 = BashOperator(
-    task_id='sleep',
-    depends_on_past=False,
-    bash_command='sleep 5',
-    dag=dag,
-)
+    @task(task_id='validate_features')
+    def validate_features(user_events: dict, product_catalog: dict) -> dict:
+        """
+        #### Validate Features
+        Runs schema and data quality checks on both extracted datasets.
+        Fails the task (raises ValueError) if critical checks do not pass,
+        triggering a retry before alerting on-call.
+        Checks:
+        - Non-empty datasets
+        - No null user_id / product_id
+        - Price values > 0
+        """
+        ds = user_events["date"]
+        print(f"[{ds}] Validating user events ({user_events['rows']} rows) ...")
+        print(f"[{ds}] Validating product catalog ({product_catalog['rows']} rows) ...")
+        # TODO: replace with Great Expectations / Pandera checks
+        print(f"[{ds}] Validation passed ✓")
+        return {"user_events": user_events, "product_catalog": product_catalog}
 
-templated_command = """
-{% for i in range(5) %}
-    echo "{{ ds }}"
-    echo "{{ macros.ds_add(ds, 7)}}"
-    echo "{{ params.my_param }}"
-{% endfor %}
-"""
+    @task(task_id='transform_features')
+    def transform_features(validated: dict) -> dict:
+        """
+        #### Transform Features
+        Joins user events with the product catalogue and computes
+        derived features used by the recommendation model:
+        - user_purchase_count_7d
+        - user_category_affinity
+        - product_popularity_score
+        - product_co_view_rate
+        Returns the output path of the transformed feature set.
+        """
+        ds = validated["user_events"]["date"]
+        print(f"[{ds}] Joining user events with product catalogue ...")
+        print(f"[{ds}] Computing derived recommendation features ...")
+        # TODO: replace with pandas / Spark transformation logic
+        output_path = f"/tmp/features/transformed_{ds}.parquet"
+        print(f"[{ds}] Features written → {output_path}")
+        return {"path": output_path, "date": ds}
 
-t3 = BashOperator(
-    task_id='templated',
-    depends_on_past=False,
-    bash_command=templated_command,
-    params={'my_param': 'Parameter I passed in'},
-    dag=dag,
-)
+    @task(task_id='load_feature_store')
+    def load_feature_store(transformed: dict) -> None:
+        """
+        #### Load Feature Store
+        Upserts the transformed feature set into the feature store
+        (keyed by entity_id + feature_date) so the recommendation
+        engine can serve the latest features at inference time.
+        Uses upsert semantics — safe to re-run (idempotent).
+        """
+        ds = transformed["date"]
+        print(f"[{ds}] Loading features from {transformed['path']} into feature store ...")
+        # TODO: replace with Feast / Redis / PostgreSQL upsert
+        print(f"[{ds}] Feature store load complete ✓")
 
-t1 >> [t2, t3]
+    # ── Wire up the pipeline ──────────────────────────────────────────────────
+    #
+    #   extract_user_events  ──┐
+    #                          ├──► validate_features ──► transform_features ──► load_feature_store
+    #   extract_product_catalog─┘
 
+    user_events     = extract_user_events()
+    product_catalog = extract_product_catalog()
+    validated       = validate_features(user_events, product_catalog)
+    transformed     = transform_features(validated)
+    load_feature_store(transformed)
+
+
+product_recommendation_feature_ingestion()

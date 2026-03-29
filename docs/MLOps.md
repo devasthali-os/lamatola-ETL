@@ -83,7 +83,7 @@ All services share a single default Docker bridge network (`lamatola-etl_default
 
 ```bash
 # Start (first time or after changes)
-docker-compose up -d
+docker-compose up
 
 # View logs
 docker-compose logs -f webserver

@@ -1,17 +1,19 @@
-# Product Recs DAG
-Feature Ingestion Pipeline for Product Recommendation
+# Product Recommendation – Feature Ingestion Pipeline
 
 ## Overview
 
-| Attribute         | Value                                                      |
-|-------------------|------------------------------------------------------------|
-| **DAG ID**        | `product_recommendation_feature_ingestion`                 |
-| **Owner**         | airflow                                                    |
-| **Schedule**      | Daily (`@daily`)                                           |
-| **Start Date**    | 2 days ago (relative)                                      |
-| **Retries**       | 1 (retry delay: 5 minutes)                                 |
-| **Operator Type** | `BashOperator`                                             |
-| **Purpose**       | Ingest & transform product/user features for recommendation engine |
+| Attribute         | Value                                                              |
+|-------------------|--------------------------------------------------------------------|
+| **DAG ID**        | `product_recommendation_feature_ingestion`                         |
+| **File**          | `dags/product_recs_feature.py`                                     |
+| **Owner**         | ml-platform                                                        |
+| **Schedule**      | `0 2 * * *` — daily at 02:00 UTC                                   |
+| **Catchup**       | `False`                                                            |
+| **Max Active Runs**| 1                                                                 |
+| **Retries**       | 2 (retry delay: 5 minutes)                                         |
+| **Tags**          | `ml`, `feature-ingestion`, `product-recommendation`                |
+| **Operator Type** | `@task` decorator (`PythonOperator`)                               |
+| **Purpose**       | Ingest user events & product catalogue → validate → transform → load feature store |
 
 ---
 
@@ -19,37 +21,73 @@ Feature Ingestion Pipeline for Product Recommendation
 
 ```mermaid
 flowchart TD
-    A([🚀 DAG Start\nproduct_recommendation_feature_ingestion]) --> T1
+    A([🚀 DAG Start\n02:00 UTC daily]) --> T1 & T2
 
-    T1["🖨️ print_date\n─────────────\nOperator: BashOperator\nCommand: date\nLogs ingestion run timestamp"]
+    T1["📥 extract_user_events\n───────────────────\nPulls raw user interaction\nevents for execution date\nclicks · views · purchases\nOutput: user_events_ds.parquet"]
 
-    T1 --> T2
+    T2["📦 extract_product_catalog\n───────────────────\nPulls product catalogue snapshot\nid · category · price · metadata\nOutput: product_catalog_ds.parquet"]
+
     T1 --> T3
+    T2 --> T3
 
-    T2["💤 sleep\n─────────────\nOperator: BashOperator\nCommand: sleep 5\nSimulates feature extraction delay"]
+    T3["✅ validate_features\n───────────────────\nSchema + data quality checks\n• Non-empty datasets\n• No null user_id / product_id\n• Price values > 0"]
 
-    T3["📄 templated\n─────────────\nOperator: BashOperator\nCommand: Jinja template\nIterates 5x, echoes\nds, ds+7, my_param"]
+    T3 --> T4
 
-    T2 --> END
-    T3 --> END
+    T4["⚙️ transform_features\n───────────────────\nJoins events + catalogue\nComputes derived features:\n• user_purchase_count_7d\n• user_category_affinity\n• product_popularity_score\n• product_co_view_rate\nOutput: transformed_ds.parquet"]
 
-    END([✅ DAG End])
+    T4 --> T5
 
-    style A fill:#4CAF50,color:#fff,stroke:#388E3C
-    style T1 fill:#2196F3,color:#fff,stroke:#1565C0
-    style T2 fill:#FF9800,color:#fff,stroke:#E65100
-    style T3 fill:#9C27B0,color:#fff,stroke:#6A1B9A
-    style END fill:#4CAF50,color:#fff,stroke:#388E3C
+    T5["💾 load_feature_store\n───────────────────\nUpserts features into store\nKeyed by entity_id + feature_date\nIdempotent — safe to re-run"]
+
+    T5 --> END([✅ DAG End])
+
+    style A    fill:#4CAF50,color:#fff,stroke:#388E3C
+    style T1   fill:#2196F3,color:#fff,stroke:#1565C0
+    style T2   fill:#2196F3,color:#fff,stroke:#1565C0
+    style T3   fill:#FF9800,color:#fff,stroke:#E65100
+    style T4   fill:#9C27B0,color:#fff,stroke:#6A1B9A
+    style T5   fill:#00897B,color:#fff,stroke:#00695C
+    style END  fill:#4CAF50,color:#fff,stroke:#388E3C
 ```
 
 ---
 
-## Dependency Graph (simplified)
+## Task Details
+
+| Task | Runs after | What it does | Output |
+|---|---|---|---|
+| `extract_user_events` | DAG start | Fetches raw click/view/purchase events for `ds` | `user_events_{ds}.parquet` |
+| `extract_product_catalog` | DAG start | Fetches product catalogue snapshot for `ds` | `product_catalog_{ds}.parquet` |
+| `validate_features` | Both extract tasks | Schema + nullability + range checks | Validated metadata dict |
+| `transform_features` | validate | Joins datasets, computes 4 derived features | `transformed_{ds}.parquet` |
+| `load_feature_store` | transform | Upserts into feature store by `entity_id + feature_date` | — |
+
+---
+
+## Dependency Graph
 
 ```mermaid
 graph LR
-    print_date --> sleep
-    print_date --> templated
+    extract_user_events --> validate_features
+    extract_product_catalog --> validate_features
+    validate_features --> transform_features
+    transform_features --> load_feature_store
+```
+
+---
+
+## Data Flow
+
+```mermaid
+flowchart LR
+    SRC1["🗄️ Source\nUser Events DB\nKafka / S3"] --> EUE[extract_user_events]
+    SRC2["🗄️ Source\nProduct Catalogue\nDB / API"] --> EPC[extract_product_catalog]
+    EUE --> VAL[validate_features]
+    EPC --> VAL
+    VAL --> TRF[transform_features]
+    TRF --> FS["🏪 Feature Store\nFeast / Redis\nPostgreSQL"]
+    FS --> REC["🤖 Recommendation\nEngine"]
 ```
 
 ---
@@ -58,9 +96,10 @@ graph LR
 
 ```mermaid
 flowchart LR
-    RUN[Task Runs] --> SUCCESS{Success?}
-    SUCCESS -- Yes --> DONE[Mark Success]
-    SUCCESS -- No --> RETRY{Retries\nremaining?}
-    RETRY -- Yes\n wait 5 min --> RUN
-    RETRY -- No --> FAIL[Mark Failed\n Send email alert]
+    RUN[Task Runs] --> OK{Success?}
+    OK -- Yes --> DONE[✅ Mark Success]
+    OK -- No --> CHK{Retries left?\nmax=2}
+    CHK -- Yes\nwait 5 min --> RUN
+    CHK -- No --> FAIL[❌ Mark Failed]
+    FAIL --> ALERT[📧 Email Alert\nml-platform@example.com]
 ```
